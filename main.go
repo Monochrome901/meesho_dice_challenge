@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,12 +41,15 @@ type LandmarksResponse struct {
 }
 
 type Landmark struct {
-	Name     string   `json:"name"`
-	Address  string   `json:"address"`
-	Distance float64  `json:"distance"`
-	PlaceID  string   `json:"place_id"`
-	Types    []string `json:"types"`
-	Location Location `json:"location"`
+	Name        string   `json:"name"`
+	Address     string   `json:"address"`
+	Distance    float64  `json:"distance"`
+	PlaceID     string   `json:"place_id"`
+	Types       []string `json:"types"`
+	Location    Location `json:"location"`
+	Rating      float32  `json:"rating"`
+	UserRatings int      `json:"user_ratings_total"`
+	PopScore    float64  `json:"popularity_score"`
 }
 
 type Location struct {
@@ -58,9 +63,10 @@ type ValidatePinCodeRequest struct {
 }
 
 type GetLandmarksRequest struct {
-	PinCode string  `json:"pin_code"`
-	City    string  `json:"city"`
-	Radius  float64 `json:"radius,omitempty"` // in meters, default 1000
+	PinCode string  `json:"pin_code,omitempty"`
+	City    string  `json:"city,omitempty"`
+	Address string  `json:"address,omitempty"` // New: Street address
+	Radius  float64 `json:"radius,omitempty"`  // in meters, default 1000
 }
 
 // Service structure
@@ -167,39 +173,73 @@ func (s *LocationService) ValidatePinCodeWithCity(ctx context.Context, pinCode, 
 	}, nil
 }
 
-// GetNearbyLandmarks fetches nearby landmarks for a given PIN code
-func (s *LocationService) GetNearbyLandmarks(ctx context.Context, pinCode, city string, radius float64) (*LandmarksResponse, error) {
-	// First validate the PIN code
-	validation, err := s.ValidatePinCodeWithCity(ctx, pinCode, city)
-	if err != nil {
-		return nil, err
-	}
+// GetNearbyLandmarks fetches nearby landmarks for a given location
+// Supports both PIN code + city and street address inputs
+func (s *LocationService) GetNearbyLandmarks(ctx context.Context, pinCode, city, address string, radius float64) (*LandmarksResponse, error) {
+	var location maps.LatLng
+	var locationAddress string
 
-	if !validation.Valid {
+	// Determine which input method to use
+	if address != "" {
+		// Use street address for geocoding
+		locationAddress = strings.TrimSpace(address)
+		geocodeReq := &maps.GeocodingRequest{
+			Address: locationAddress,
+		}
+
+		geocodeResults, err := s.mapsClient.Geocode(ctx, geocodeReq)
+		if err != nil {
+			return nil, fmt.Errorf("geocoding address failed: %v", err)
+		}
+
+		if len(geocodeResults) == 0 {
+			return &LandmarksResponse{
+				Success: false,
+				Message: "Could not find the specified address",
+			}, nil
+		}
+
+		location = geocodeResults[0].Geometry.Location
+		locationAddress = geocodeResults[0].FormattedAddress
+	} else if pinCode != "" && city != "" {
+		// Use PIN code + city method (original logic)
+		validation, err := s.ValidatePinCodeWithCity(ctx, pinCode, city)
+		if err != nil {
+			return nil, err
+		}
+
+		if !validation.Valid {
+			return &LandmarksResponse{
+				Success: false,
+				Message: validation.Message,
+			}, nil
+		}
+
+		// Geocode to get exact coordinates
+		geocodeReq := &maps.GeocodingRequest{
+			Address: fmt.Sprintf("%s, %s", pinCode, city),
+		}
+
+		geocodeResults, err := s.mapsClient.Geocode(ctx, geocodeReq)
+		if err != nil {
+			return nil, fmt.Errorf("geocoding failed: %v", err)
+		}
+
+		if len(geocodeResults) == 0 {
+			return &LandmarksResponse{
+				Success: false,
+				Message: "Could not find location coordinates",
+			}, nil
+		}
+
+		location = geocodeResults[0].Geometry.Location
+		locationAddress = geocodeResults[0].FormattedAddress
+	} else {
 		return &LandmarksResponse{
 			Success: false,
-			Message: validation.Message,
+			Message: "Please provide either an address OR both pin code and city",
 		}, nil
 	}
-
-	// Geocode to get exact coordinates
-	geocodeReq := &maps.GeocodingRequest{
-		Address: fmt.Sprintf("%s, %s", pinCode, city),
-	}
-
-	geocodeResults, err := s.mapsClient.Geocode(ctx, geocodeReq)
-	if err != nil {
-		return nil, fmt.Errorf("geocoding failed: %v", err)
-	}
-
-	if len(geocodeResults) == 0 {
-		return &LandmarksResponse{
-			Success: false,
-			Message: "Could not find location coordinates",
-		}, nil
-	}
-
-	location := geocodeResults[0].Geometry.Location
 
 	// Default radius
 	if radius == 0 {
@@ -218,36 +258,78 @@ func (s *LocationService) GetNearbyLandmarks(ctx context.Context, pinCode, city 
 		return nil, fmt.Errorf("nearby search failed: %v", err)
 	}
 
-	// Process and select top 3 landmarks
-	landmarks := []Landmark{}
-	for i, place := range nearbyResults.Results {
-		if i >= 3 {
-			break
-		}
+	// Process all results and calculate scores
+	type scoredLandmark struct {
+		landmark Landmark
+		score    float64
+	}
 
+	scoredLandmarks := []scoredLandmark{}
+
+	for _, place := range nearbyResults.Results {
 		// Calculate distance
 		distance := calculateDistance(
 			location.Lat, location.Lng,
 			place.Geometry.Location.Lat, place.Geometry.Location.Lng,
 		)
 
+		// Skip places that are too close (likely the same location) or have no reviews
+		if distance < 10 || place.UserRatingsTotal == 0 {
+			continue
+		}
+
+		// Calculate popularity score
+		// Formula: (rating * log10(reviews + 1)) / (1 + distance/1000)
+		// This balances rating, number of reviews, and distance
+		reviewScore := float64(place.Rating) * math.Log10(float64(place.UserRatingsTotal)+1)
+		distancePenalty := 1.0 + (distance / 1000.0) // Penalty increases with distance
+		popScore := reviewScore / distancePenalty
+
 		landmark := Landmark{
-			Name:     place.Name,
-			Address:  place.Vicinity,
-			Distance: distance,
-			PlaceID:  place.PlaceID,
-			Types:    place.Types,
+			Name:        place.Name,
+			Address:     place.Vicinity,
+			Distance:    distance,
+			PlaceID:     place.PlaceID,
+			Types:       place.Types,
+			Rating:      place.Rating,
+			UserRatings: place.UserRatingsTotal,
+			PopScore:    popScore,
 			Location: Location{
 				Lat: place.Geometry.Location.Lat,
 				Lng: place.Geometry.Location.Lng,
 			},
 		}
-		landmarks = append(landmarks, landmark)
+
+		scoredLandmarks = append(scoredLandmarks, scoredLandmark{
+			landmark: landmark,
+			score:    popScore,
+		})
+	}
+
+	// Sort by popularity score (highest first)
+	sort.Slice(scoredLandmarks, func(i, j int) bool {
+		return scoredLandmarks[i].score > scoredLandmarks[j].score
+	})
+
+	// Select top landmarks (up to 5)
+	landmarks := []Landmark{}
+	maxLandmarks := 5
+	if len(scoredLandmarks) < maxLandmarks {
+		maxLandmarks = len(scoredLandmarks)
+	}
+
+	for i := 0; i < maxLandmarks; i++ {
+		landmarks = append(landmarks, scoredLandmarks[i].landmark)
+	}
+
+	message := fmt.Sprintf("Found %d landmarks near %s", len(landmarks), locationAddress)
+	if len(landmarks) == 0 {
+		message = "No landmarks found in the specified area. Try increasing the search radius."
 	}
 
 	return &LandmarksResponse{
 		Success:   true,
-		Message:   "Landmarks fetched successfully",
+		Message:   message,
 		Landmarks: landmarks,
 		Location: Location{
 			Lat: location.Lat,
@@ -256,18 +338,22 @@ func (s *LocationService) GetNearbyLandmarks(ctx context.Context, pinCode, city 
 	}, nil
 }
 
-// calculateDistance calculates distance between two coordinates in meters
+// calculateDistance calculates distance between two coordinates in meters using Haversine formula
 func calculateDistance(lat1, lon1, lat2, lon2 float64) float64 {
 	const earthRadius = 6371000 // meters
+	const pi = 3.14159265359
 
-	lat1Rad := lat1 * (3.14159265359 / 180)
-	lat2Rad := lat2 * (3.14159265359 / 180)
-	deltaLat := (lat2 - lat1) * (3.14159265359 / 180)
-	deltaLon := (lon2 - lon1) * (3.14159265359 / 180)
+	lat1Rad := lat1 * (pi / 180)
+	lat2Rad := lat2 * (pi / 180)
+	deltaLat := (lat2 - lat1) * (pi / 180)
+	deltaLon := (lon2 - lon1) * (pi / 180)
 
-	a := (deltaLat/2)*(deltaLat/2) +
-		(lat1Rad)*(lat2Rad)*(deltaLon/2)*(deltaLon/2)
-	c := 2 * a
+	sinDeltaLat := math.Sin(deltaLat / 2)
+	sinDeltaLon := math.Sin(deltaLon / 2)
+
+	a := sinDeltaLat*sinDeltaLat +
+		math.Cos(lat1Rad)*math.Cos(lat2Rad)*sinDeltaLon*sinDeltaLon
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 
 	return earthRadius * c
 }
@@ -303,7 +389,7 @@ func (s *LocationService) handleGetLandmarks(w http.ResponseWriter, r *http.Requ
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	response, err := s.GetNearbyLandmarks(ctx, req.PinCode, req.City, req.Radius)
+	response, err := s.GetNearbyLandmarks(ctx, req.PinCode, req.City, req.Address, req.Radius)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get landmarks: %v", err), http.StatusInternalServerError)
 		return
@@ -385,7 +471,7 @@ func main() {
 	log.Printf("Starting server on port %s", port)
 	log.Printf("Endpoints:")
 	log.Printf("  POST /api/validate-pincode - Validate PIN code with city")
-	log.Printf("  POST /api/get-landmarks - Get nearby landmarks")
+	log.Printf("  POST /api/get-landmarks - Get nearby landmarks (supports address or pin+city)")
 	log.Printf("  GET  /health - Health check")
 	log.Printf("  GET  /        - Frontend UI")
 
